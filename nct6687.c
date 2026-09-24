@@ -499,6 +499,39 @@ static const struct dmi_system_id nct6687_msi_alt_boards[] = {
 	{},
 };
 
+
+/*
+ * ASRock boards with the NCT6686D EC (verified on B850I Lightning WiFi) do not
+ * act on the direct PWM registers at 0xA28-0xA2F.  Those read back a constant
+ * 0x80 and the EC rejects the configuration as invalid on CFG_DONE.  Instead
+ * the EC evaluates a 7-point fan curve per channel, based at 0x0B00 with a
+ * stride of 0x18:
+ *
+ *   base + 0x00 .. 0x06   7 temperature points (degrees C)
+ *   base + 0x08 .. 0x15   7 duty points (2 bytes each, value in the low byte)
+ *
+ * Verified against live hardware: interpolating the stored curve at the
+ * channel's source temperature exactly reproduces the duty the EC reports at
+ * 0x160 + index (three channels, three exact matches).
+ *
+ * reg_pwm_write therefore addresses the duty array, so nct6687_write_all_curve()
+ * flattens the curve to implement a fixed duty.
+ */
+static const struct nct6687_fan_config nct6687_fan_config_asrock[] = {
+	{.reg_rpm = 0x140, .reg_pwm = 0x160, .reg_pwm_write = 0x0B08, .label = "CPU Fan"},
+	{.reg_rpm = 0x142, .reg_pwm = 0x161, .reg_pwm_write = 0x0B20, .label = "Pump Fan"},
+	{.reg_rpm = 0x144, .reg_pwm = 0x162, .reg_pwm_write = 0x0B38, .label = "System Fan #1"},
+	{.reg_rpm = 0x146, .reg_pwm = 0x163, .reg_pwm_write = 0x0B50, .label = "System Fan #2"},
+	{.reg_rpm = 0x148, .reg_pwm = 0x164, .reg_pwm_write = 0x0B68, .label = "System Fan #3"},
+	{.reg_rpm = 0x14A, .reg_pwm = 0x165, .reg_pwm_write = 0x0B80, .label = "System Fan #4"},
+	{.reg_rpm = 0x14C, .reg_pwm = 0x166, .reg_pwm_write = 0x0B98, .label = "System Fan #5"},
+	{.reg_rpm = 0x14E, .reg_pwm = 0x167, .reg_pwm_write = 0x0BB0, .label = "System Fan #6"},
+};
+
+static bool asrock_curve = true;
+module_param(asrock_curve, bool, 0444);
+MODULE_PARM_DESC(asrock_curve, "Use the ASRock 7-point curve registers for PWM writes on NCT6686D (default: on)");
+
 static const struct nct6687_board_data *nct6687_board;
 
 static int nct6687_fan_config_type = FAN_CONFIG_DEFAULT; // default
@@ -757,8 +790,22 @@ static void nct6687_write_all_curve(struct nct6687_data *data, u16 base_address,
 		nct6687_write(data, base_address + (i * NCT6687_FAN_CURVE_POINT_SIZE), value);
 }
 
+static bool nct6687_use_asrock_curve;
+
+/*
+ * The ASRock EC only honours the curve while the channel is in automatic mode.
+ * Setting the manual-control bit makes it read the inert 0xA28+ byte instead
+ * and ignore the curve, so manual control is emulated by flattening the curve
+ * while leaving the EC in auto.  The mode is therefore tracked in software.
+ */
+static bool nct6687_asrock_manual[NCT6687_NUM_REG_FAN];
+
 static bool nct6687_uses_msi_fan_curve(int index)
 {
+	/* On ASRock's NCT6686D every channel is curve-driven. */
+	if (nct6687_use_asrock_curve)
+		return true;
+
 	return index >= NCT6687_FIRST_SYSTEM_FAN_INDEX &&
 	       nct6687_fan_config_type == FAN_CONFIG_MSI_ALT1 &&
 	       msi_fan_brute_force;
@@ -864,6 +911,9 @@ static void nct6687_update_voltage(struct nct6687_data *data)
 static enum pwm_enable nct6687_get_pwm_enable(struct nct6687_data *data, int index)
 {
 	u16 bit_mask = BIT(index);
+
+	if (nct6687_use_asrock_curve)
+		return nct6687_asrock_manual[index] ? manual_mode : auto_mode;
 
 	if (nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index)) & bit_mask)
 		return manual_mode;
@@ -1048,10 +1098,15 @@ static int nct6687_write_pwm(struct device *dev, int index, long val)
 		return -EIO;
 	}
 
-	mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
-	bit_mask = BIT(index);
-	mode = (u8)(mode | bit_mask);
-	nct6687_write(data, NCT6687_REG_FAN_CTRL_MODE(index), mode);
+	if (nct6687_use_asrock_curve) {
+		/* Leave the EC in auto mode so it keeps evaluating the curve. */
+		nct6687_asrock_manual[index] = true;
+	} else {
+		mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
+		bit_mask = BIT(index);
+		mode = (u8)(mode | bit_mask);
+		nct6687_write(data, NCT6687_REG_FAN_CTRL_MODE(index), mode);
+	}
 
 	if (nct6687_uses_msi_fan_curve(index)) {
 		success = nct6687_curve_matches(data, NCT6687_REG_PWM_WRITE(index), val);
@@ -1114,22 +1169,26 @@ static int nct6687_write_pwm_enable(struct device *dev, int index, long val)
 		}
 	}
 
-	mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
-
-	bit_mask = BIT(index);
-	if (val == manual_mode) {
-		mode = (u8)(mode | bit_mask);
+	if (nct6687_use_asrock_curve) {
+		nct6687_asrock_manual[index] = (val == manual_mode);
 	} else {
-		/* auto_mode or NCT6687_LEGACY_AUTO_MODE — clear the manual-control bit. */
-		mode = (u8)(mode & ~bit_mask);
-	}
+		mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
 
-	nct6687_write(data, NCT6687_REG_FAN_CTRL_MODE(index), mode);
-	mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
-	if (!!(mode & bit_mask) != (val == manual_mode)) {
-		pr_err("Failed to verify fan %d control mode\n", index);
-		mutex_unlock(&data->update_lock);
-		return -EIO;
+		bit_mask = BIT(index);
+		if (val == manual_mode) {
+			mode = (u8)(mode | bit_mask);
+		} else {
+			/* auto_mode or NCT6687_LEGACY_AUTO_MODE — clear the manual-control bit. */
+			mode = (u8)(mode & ~bit_mask);
+		}
+
+		nct6687_write(data, NCT6687_REG_FAN_CTRL_MODE(index), mode);
+		mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
+		if (!!(mode & bit_mask) != (val == manual_mode)) {
+			pr_err("Failed to verify fan %d control mode\n", index);
+			mutex_unlock(&data->update_lock);
+			return -EIO;
+		}
 	}
 
 	if (val != manual_mode) {
@@ -1733,6 +1792,12 @@ static int nct6687_probe(struct platform_device *pdev)
 	mutex_init(&data->fan_watchdog_lock);
 	INIT_DELAYED_WORK(&data->fan_watchdog_work, nct6687_fan_watchdog_work);
 	platform_set_drvdata(pdev, data);
+
+	if (data->kind == nct6686 && asrock_curve) {
+		nct6687_fan_config_active = nct6687_fan_config_asrock;
+		nct6687_use_asrock_curve = true;
+		dev_info(dev, "ASRock NCT6686D: using 7-point curve registers for PWM control\n");
+	}
 
 	/* Register before hwmon so its sysfs interface is removed first. */
 	err = devm_add_action_or_reset(dev, nct6687_restore_firmware_state, dev);
