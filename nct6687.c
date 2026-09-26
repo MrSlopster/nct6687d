@@ -393,6 +393,7 @@ static const struct nct6687_fan_config nct6687_fan_config_msi_alt[] = {
 enum nct6687_fan_config_type {
 	FAN_CONFIG_DEFAULT = 0,
 	FAN_CONFIG_MSI_ALT1, // some MSI B850, X870, and Z890 boards
+	FAN_CONFIG_ASROCK,   // ASRock boards whose NCT6686D EC is curve-driven
 };
 
 struct nct6687_board_data {
@@ -528,13 +529,37 @@ static const struct nct6687_fan_config nct6687_fan_config_asrock[] = {
 	{.reg_rpm = 0x14E, .reg_pwm = 0x167, .reg_pwm_write = 0x0BB0, .label = "System Fan #6"},
 };
 
-static bool asrock_curve = true;
-module_param(asrock_curve, bool, 0444);
-MODULE_PARM_DESC(asrock_curve, "Use the ASRock 7-point curve registers for PWM writes on NCT6686D (default: on)");
+/*
+ * ASRock boards confirmed to need the curve-based PWM path.  Only boards this
+ * has actually been verified on belong here; the mapping can also be forced
+ * with fan_config=asrock for testing on other ASRock NCT6686D boards.
+ */
+#define NCT6687_DMI_ASROCK_BOARD(_name) { \
+	.matches = { \
+		DMI_MATCH(DMI_BOARD_VENDOR, "ASRock"), \
+		DMI_MATCH(DMI_BOARD_NAME, _name), \
+	}, \
+}
+
+static const struct dmi_system_id nct6687_asrock_curve_boards[] = {
+	NCT6687_DMI_ASROCK_BOARD("B850I Lightning WiFi"),
+	{}
+};
+
+static bool nct6687_match_asrock_board(void)
+{
+	return dmi_first_match(nct6687_asrock_curve_boards) != NULL;
+}
 
 static const struct nct6687_board_data *nct6687_board;
 
 static int nct6687_fan_config_type = FAN_CONFIG_DEFAULT; // default
+
+static bool nct6687_uses_asrock_curve(void)
+{
+	return nct6687_fan_config_type == FAN_CONFIG_ASROCK;
+}
+
 static const struct nct6687_fan_config *nct6687_fan_config_active =
 	nct6687_fan_config_default;
 
@@ -609,6 +634,10 @@ static int nct6687_fan_config_op_write_handler(const char *val, const struct ker
 		nct6687_fan_config_type = FAN_CONFIG_MSI_ALT1;
 		nct6687_fan_config_active = nct6687_fan_config_msi_alt;
 		nct6687_fan_channels = nct6687_msi_alt_channels();
+	} else if (!strcmp(s, "asrock")) {
+		nct6687_fan_config_type = FAN_CONFIG_ASROCK;
+		nct6687_fan_config_active = nct6687_fan_config_asrock;
+		nct6687_fan_channels = NCT6687_NUM_REG_FAN;
 	} else {
 		return -EINVAL;
 	}
@@ -627,6 +656,10 @@ static int nct6687_fan_config_op_read_handler(char *buffer, const struct kernel_
 
 	case FAN_CONFIG_MSI_ALT1:
 		config = "msi_alt1";
+		break;
+
+	case FAN_CONFIG_ASROCK:
+		config = "asrock";
 		break;
 
 	default:
@@ -657,7 +690,7 @@ static const struct kernel_param_ops nct6687_fan_config_op_ops = {
  * exists).
  */
 module_param_cb(fan_config, &nct6687_fan_config_op_ops, NULL, 0444);
-MODULE_PARM_DESC(fan_config, "Fan register mapping (default or msi_alt1)");
+MODULE_PARM_DESC(fan_config, "Fan register mapping (default, msi_alt1 or asrock)");
 
 /* ------------------------------------------------------- */
 struct nct6687_data {
@@ -690,6 +723,12 @@ struct nct6687_data {
 	u8 _initialFanPwmCommand[NCT6687_NUM_REG_FAN];
 	u8 _initialFanCurve[NCT6687_NUM_REG_FAN][NCT6687_FAN_CURVE_POINTS];
 	bool _restoreDefaultFanControlRequired[NCT6687_NUM_REG_FAN];
+	/*
+	 * Emulated manual-control state for curve-driven ASRock channels.  The
+	 * EC stays in automatic mode there (see nct6687_asrock_force_ec_auto),
+	 * so the manual/auto distinction has no hardware bit to read back.
+	 */
+	bool asrock_manual[NCT6687_NUM_REG_FAN];
 	/*
 	 * Serializes watchdog state changes with delayed-work operations.
 	 * Lock ordering: fan_watchdog_lock, then update_lock.
@@ -790,20 +829,14 @@ static void nct6687_write_all_curve(struct nct6687_data *data, u16 base_address,
 		nct6687_write(data, base_address + (i * NCT6687_FAN_CURVE_POINT_SIZE), value);
 }
 
-static bool nct6687_use_asrock_curve;
-
 /*
- * The ASRock EC only honours the curve while the channel is in automatic mode.
- * Setting the manual-control bit makes it read the inert 0xA28+ byte instead
- * and ignore the curve, so manual control is emulated by flattening the curve
- * while leaving the EC in auto.  The mode is therefore tracked in software.
+ * True when PWM changes must be written as a flattened fan curve rather than a
+ * single duty byte.  MSI's alternative mapping needs this for the system fans;
+ * on ASRock's NCT6686D every channel is curve-driven.
  */
-static bool nct6687_asrock_manual[NCT6687_NUM_REG_FAN];
-
-static bool nct6687_uses_msi_fan_curve(int index)
+static bool nct6687_uses_curve_write(int index)
 {
-	/* On ASRock's NCT6686D every channel is curve-driven. */
-	if (nct6687_use_asrock_curve)
+	if (nct6687_uses_asrock_curve())
 		return true;
 
 	return index >= NCT6687_FIRST_SYSTEM_FAN_INDEX &&
@@ -912,8 +945,8 @@ static enum pwm_enable nct6687_get_pwm_enable(struct nct6687_data *data, int ind
 {
 	u16 bit_mask = BIT(index);
 
-	if (nct6687_use_asrock_curve)
-		return nct6687_asrock_manual[index] ? manual_mode : auto_mode;
+	if (nct6687_uses_asrock_curve())
+		return data->asrock_manual[index] ? manual_mode : auto_mode;
 
 	if (nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index)) & bit_mask)
 		return manual_mode;
@@ -1072,6 +1105,58 @@ static bool finish_fan_cfg_update(struct nct6687_data *data, int fan)
 	return success;
 }
 
+/*
+ * The ASRock EC evaluates the fan curve only while the channel is in automatic
+ * mode.  With the manual-control bit set it drives the fan from the inert
+ * 0xA28+ byte (which reads back a constant 0x80) and ignores the curve
+ * entirely, so clear the bit before relying on a curve write.
+ *
+ * Must be called inside a fan configuration phase.
+ */
+static bool nct6687_asrock_force_ec_auto(struct nct6687_data *data, int index)
+{
+	u8 bit_mask = BIT(index);
+	u8 mode;
+
+	mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
+	if (!(mode & bit_mask))
+		return true;
+
+	nct6687_write(data, NCT6687_REG_FAN_CTRL_MODE(index), (u8)(mode & ~bit_mask));
+
+	mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
+	if (mode & bit_mask) {
+		pr_err("Failed to clear EC manual-control bit for fan %d\n", index);
+		return false;
+	}
+
+	return true;
+}
+
+/* Flatten an ASRock channel's curve to a single duty. */
+static bool nct6687_asrock_apply_flat_curve(struct nct6687_data *data, int index, u8 duty)
+{
+	bool success;
+
+	if (!start_fan_cfg_update(data, index))
+		return false;
+
+	if (!nct6687_asrock_force_ec_auto(data, index)) {
+		finish_fan_cfg_update(data, index);
+		return false;
+	}
+
+	nct6687_write_all_curve(data, NCT6687_REG_PWM_WRITE(index), duty);
+	success = nct6687_curve_matches(data, NCT6687_REG_PWM_WRITE(index), duty);
+	if (!success)
+		pr_err("Failed to verify fan %d curve write\n", index);
+
+	if (!finish_fan_cfg_update(data, index))
+		success = false;
+
+	return success;
+}
+
 static int nct6687_write_pwm(struct device *dev, int index, long val)
 {
 	struct nct6687_data *data = dev_get_drvdata(dev);
@@ -1098,9 +1183,13 @@ static int nct6687_write_pwm(struct device *dev, int index, long val)
 		return -EIO;
 	}
 
-	if (nct6687_use_asrock_curve) {
-		/* Leave the EC in auto mode so it keeps evaluating the curve. */
-		nct6687_asrock_manual[index] = true;
+	if (nct6687_uses_asrock_curve()) {
+		/* The curve is only honoured while the EC is in auto mode. */
+		if (!nct6687_asrock_force_ec_auto(data, index)) {
+			finish_fan_cfg_update(data, index);
+			mutex_unlock(&data->update_lock);
+			return -EIO;
+		}
 	} else {
 		mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
 		bit_mask = BIT(index);
@@ -1108,14 +1197,14 @@ static int nct6687_write_pwm(struct device *dev, int index, long val)
 		nct6687_write(data, NCT6687_REG_FAN_CTRL_MODE(index), mode);
 	}
 
-	if (nct6687_uses_msi_fan_curve(index)) {
+	if (nct6687_uses_curve_write(index)) {
 		success = nct6687_curve_matches(data, NCT6687_REG_PWM_WRITE(index), val);
 		if (!success) {
 			nct6687_write_all_curve(data, NCT6687_REG_PWM_WRITE(index), val);
 			success = nct6687_curve_matches(data, NCT6687_REG_PWM_WRITE(index), val);
 		}
 		if (!success)
-			pr_err("Failed to verify MSI fan %d curve write\n", index);
+			pr_err("Failed to verify fan %d curve write\n", index);
 	} else {
 		nct6687_write(data, NCT6687_REG_PWM_WRITE(index), val);
 		success = nct6687_read(data, NCT6687_REG_PWM_WRITE(index)) == val;
@@ -1125,6 +1214,10 @@ static int nct6687_write_pwm(struct device *dev, int index, long val)
 
 	if (!finish_fan_cfg_update(data, index))
 		success = false;
+
+	/* Only claim manual control once the requested change actually landed. */
+	if (nct6687_uses_asrock_curve() && success)
+		data->asrock_manual[index] = true;
 
 	data->pwm[index] = nct6687_read(data, NCT6687_REG_PWM(index));
 	data->pwm_enable[index] = nct6687_get_pwm_enable(data, index);
@@ -1169,8 +1262,24 @@ static int nct6687_write_pwm_enable(struct device *dev, int index, long val)
 		}
 	}
 
-	if (nct6687_use_asrock_curve) {
-		nct6687_asrock_manual[index] = (val == manual_mode);
+	if (nct6687_uses_asrock_curve()) {
+		if (val == manual_mode) {
+			/*
+			 * Hold the fan where the EC is currently driving it.
+			 * Without this the EC keeps running the original curve
+			 * until someone writes pwmN, even though the driver
+			 * already reports manual mode.
+			 */
+			u8 duty = nct6687_read(data, NCT6687_REG_PWM(index));
+
+			if (!nct6687_asrock_apply_flat_curve(data, index, duty)) {
+				mutex_unlock(&data->update_lock);
+				return -EIO;
+			}
+		}
+
+		/* Update the emulated state only after the change succeeded. */
+		data->asrock_manual[index] = (val == manual_mode);
 	} else {
 		mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
 
@@ -1226,7 +1335,7 @@ static bool nct6687_save_fan_control(struct nct6687_data *data, int index)
 	if (!start_fan_cfg_update(data, index))
 		return false;
 
-	if (nct6687_uses_msi_fan_curve(index)) {
+	if (nct6687_uses_curve_write(index)) {
 		nct6687_read_curve(data, NCT6687_REG_PWM_WRITE(index),
 				   data->_initialFanCurve[index]);
 	} else {
@@ -1237,14 +1346,17 @@ static bool nct6687_save_fan_control(struct nct6687_data *data, int index)
 	if (!finish_fan_cfg_update(data, index))
 		return false;
 
-	if (nct6687_uses_msi_fan_curve(index))
-		pr_debug("Saved MSI fan %d curve: %*ph\n", index,
-			 NCT6687_FAN_CURVE_POINTS, data->_initialFanCurve[index]);
-	else
-		pr_debug("Saved fan %d PWM target: %u\n", index,
-			 data->_initialFanPwmCommand[index]);
-
 	data->_initialFanControlMode[index] = (u8)(reg & bit_mask);
+
+	if (nct6687_uses_curve_write(index))
+		pr_debug("Saved fan %d curve: %*ph, mode bit: %u\n", index,
+			 NCT6687_FAN_CURVE_POINTS, data->_initialFanCurve[index],
+			 !!data->_initialFanControlMode[index]);
+	else
+		pr_debug("Saved fan %d PWM target: %u, mode bit: %u\n", index,
+			 data->_initialFanPwmCommand[index],
+			 !!data->_initialFanControlMode[index]);
+
 	data->_restoreDefaultFanControlRequired[index] = true;
 
 	return true;
@@ -1260,13 +1372,13 @@ static bool nct6687_restore_fan_pwm(struct nct6687_data *data, int index)
 	if (!start_fan_cfg_update(data, index))
 		return false;
 
-	if (nct6687_uses_msi_fan_curve(index)) {
+	if (nct6687_uses_curve_write(index)) {
 		nct6687_write_curve(data, NCT6687_REG_PWM_WRITE(index),
 				    data->_initialFanCurve[index]);
 		success = nct6687_curve_equals(data, NCT6687_REG_PWM_WRITE(index),
 					       data->_initialFanCurve[index]);
 		if (!success)
-			pr_err("Failed to verify MSI fan %d curve restore\n", index);
+			pr_err("Failed to verify fan %d curve restore\n", index);
 	} else {
 		nct6687_write(data, NCT6687_REG_PWM_WRITE(index),
 			      data->_initialFanPwmCommand[index]);
@@ -1299,6 +1411,7 @@ static bool nct6687_restore_fan_control(struct nct6687_data *data, int index)
 			return false;
 		}
 		data->_restoreDefaultFanControlRequired[index] = false;
+		data->asrock_manual[index] = false;
 
 		pr_debug("%s[%d], addr=%04X, ctrl=%04X, _initialFanPwmCommand=%d\n",
 			 __func__, index, NCT6687_REG_FAN_PWM_COMMAND(index),
@@ -1777,7 +1890,8 @@ static int nct6687_probe(struct platform_device *pdev)
 	 * that needs the default mapping) are obvious from dmesg.
 	 */
 	dev_info(dev, "active fan config=%s, SYS_FAN reg_rpm=0x%04X/0x%04X/0x%04X\n",
-		 nct6687_fan_config_type == FAN_CONFIG_MSI_ALT1 ? "msi_alt1" : "default",
+		 nct6687_fan_config_type == FAN_CONFIG_MSI_ALT1 ? "msi_alt1" :
+		 nct6687_fan_config_type == FAN_CONFIG_ASROCK ? "asrock" : "default",
 		 nct6687_fan_config_active[2].reg_rpm,
 		 nct6687_fan_config_active[3].reg_rpm,
 		 nct6687_fan_config_active[4].reg_rpm);
@@ -1792,12 +1906,6 @@ static int nct6687_probe(struct platform_device *pdev)
 	mutex_init(&data->fan_watchdog_lock);
 	INIT_DELAYED_WORK(&data->fan_watchdog_work, nct6687_fan_watchdog_work);
 	platform_set_drvdata(pdev, data);
-
-	if (data->kind == nct6686 && asrock_curve) {
-		nct6687_fan_config_active = nct6687_fan_config_asrock;
-		nct6687_use_asrock_curve = true;
-		dev_info(dev, "ASRock NCT6686D: using 7-point curve registers for PWM control\n");
-	}
 
 	/* Register before hwmon so its sysfs interface is removed first. */
 	err = devm_add_action_or_reset(dev, nct6687_restore_firmware_state, dev);
@@ -2031,6 +2139,11 @@ static int __init sensors_nct6687_init(void)
 		nct6687_fan_config_type = FAN_CONFIG_MSI_ALT1;
 		nct6687_fan_config_active = nct6687_fan_config_msi_alt;
 		nct6687_fan_channels = nct6687_msi_alt_channels();
+	} else if (nct6687_fan_config_type == FAN_CONFIG_DEFAULT &&
+		   nct6687_match_asrock_board()) {
+		pr_info("Detected ASRock board requiring curve-based fan control\n");
+		nct6687_fan_config_type = FAN_CONFIG_ASROCK;
+		nct6687_fan_config_active = nct6687_fan_config_asrock;
 	}
 
 	/*
